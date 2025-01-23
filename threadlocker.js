@@ -1,5 +1,6 @@
 require('dotenv').config();
-const { Client, Events, GatewayIntentBits, performance } = require('discord.js');
+const { Client, Events, GatewayIntentBits } = require('discord.js'); // Removed performance from import
+const { performance } = require('perf_hooks'); // Import the correct performance object
 
 // Constants and Cache Configuration
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
