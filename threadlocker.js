@@ -1,20 +1,78 @@
 require('dotenv').config();
-const { Client, Events, GatewayIntentBits } = require('discord.js'); // Removed performance from import
-const { performance } = require('perf_hooks'); // Import the correct performance object
+const { Client, Events, GatewayIntentBits } = require('discord.js');
+const { performance } = require('perf_hooks');
 
-// Constants and Cache Configuration
+// Constants
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 const RATE_LIMIT_MAX_OPS = 5;
 const RATE_LIMIT_WINDOW = 10000;
 const RETRY_MAX_ATTEMPTS = 2;
 const BATCH_SIZE = 5;
+const OPERATION_DELAY = 100;
 
-// Utility Classes
+// Logging utility
+function logWithTimestamp(message) {
+    const timestamp = new Date().toISOString().replace('T', ' ').replace('Z', '');
+    console.log(`[${timestamp}] ${message}`);
+}
+
+// Enhanced Thread Cache
+class ThreadCache {
+  constructor(duration = CACHE_DURATION) {
+    this.cache = new Map();
+    this.duration = duration;
+    setInterval(() => this.cleanup(), duration);
+  }
+
+  set(channelId, threads) {
+    this.cache.set(channelId, {
+      timestamp: Date.now(),
+      threads: threads
+    });
+  }
+
+  get(channelId) {
+    const data = this.cache.get(channelId);
+    if (!data || Date.now() - data.timestamp > this.duration) {
+      this.cache.delete(channelId);
+      return null;
+    }
+    return data.threads;
+  }
+
+  cleanup() {
+    const now = Date.now();
+    for (const [channelId, data] of this.cache.entries()) {
+      if (now - data.timestamp > this.duration) {
+        this.cache.delete(channelId);
+      }
+    }
+    logWithTimestamp('Cache cleanup completed');
+  }
+}
+
+// Enhanced Rate Limit
 class RateLimit {
   constructor(maxOperations = RATE_LIMIT_MAX_OPS, timeWindow = RATE_LIMIT_WINDOW) {
     this.operations = new Map();
     this.maxOperations = maxOperations;
     this.timeWindow = timeWindow;
+    this.queue = new Map();
+    
+    setInterval(() => this.cleanup(), 60000);
+  }
+
+  cleanup() {
+    const now = Date.now();
+    for (const [threadId, ops] of this.operations.entries()) {
+      const validOps = ops.filter(time => now - time < this.timeWindow);
+      if (validOps.length === 0) {
+        this.operations.delete(threadId);
+      } else {
+        this.operations.set(threadId, validOps);
+      }
+    }
+    logWithTimestamp('Rate limit cleanup completed');
   }
 
   async canProceed(threadId) {
@@ -23,7 +81,19 @@ class RateLimit {
     const validOps = recentOps.filter(time => now - time < this.timeWindow);
     
     if (validOps.length >= this.maxOperations) {
-      return false;
+      if (!this.queue.has(threadId)) {
+        this.queue.set(threadId, []);
+      }
+      
+      return new Promise(resolve => {
+        this.queue.get(threadId).push(resolve);
+        setTimeout(() => {
+          const callbacks = this.queue.get(threadId) || [];
+          const callback = callbacks.shift();
+          if (callback) callback(true);
+          if (callbacks.length === 0) this.queue.delete(threadId);
+        }, this.timeWindow);
+      });
     }
     
     validOps.push(now);
@@ -32,35 +102,163 @@ class RateLimit {
   }
 }
 
+// Enhanced Performance Monitor
 class PerformanceMonitor {
   constructor() {
     this.metrics = new Map();
+    this.history = new Map();
   }
 
   start(operation) {
-    this.metrics.set(operation, performance.now());
+    this.metrics.set(operation, {
+      startTime: performance.now(),
+      memory: process.memoryUsage()
+    });
   }
 
   end(operation) {
-    const startTime = this.metrics.get(operation);
-    if (startTime) {
-      const duration = performance.now() - startTime;
-      console.log(`Operation "${operation}" took ${duration.toFixed(2)}ms`);
+    const data = this.metrics.get(operation);
+    if (data) {
+      const duration = performance.now() - data.startTime;
+      const memoryDiff = {
+        heapUsed: process.memoryUsage().heapUsed - data.memory.heapUsed
+      };
+      
+      if (!this.history.has(operation)) {
+        this.history.set(operation, []);
+      }
+      
+      this.history.get(operation).push({ duration, memoryDiff });
+      
+      if (this.history.get(operation).length > 100) {
+        this.history.get(operation).shift();
+      }
+
+      logWithTimestamp(`Operation "${operation}":
+        Duration: ${duration.toFixed(2)}ms
+        Memory Impact: ${(memoryDiff.heapUsed / 1024 / 1024).toFixed(2)}MB`);
+      
       this.metrics.delete(operation);
+    }
+  }
+
+  getMetrics(operation) {
+    return this.history.get(operation) || [];
+  }
+}
+
+// Instances
+const threadCache = new ThreadCache();
+const rateLimit = new RateLimit();
+const perfMonitor = new PerformanceMonitor();
+
+// Enhanced Utility Functions
+async function withRetry(operation, maxRetries = RETRY_MAX_ATTEMPTS) {
+  let lastError;
+  const delays = [1000, 2000, 4000];
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxRetries) break;
+      
+      const delay = delays[attempt - 1] || delays[delays.length - 1];
+      logWithTimestamp(`Retry attempt ${attempt} of ${maxRetries}. Waiting ${delay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  throw new Error(`Operation failed after ${maxRetries} attempts: ${lastError.message}`);
+}
+
+async function getThreadsWithCache(channel) {
+  const cachedThreads = threadCache.get(channel.id);
+  if (cachedThreads) {
+    logWithTimestamp('Using cached threads');
+    return cachedThreads;
+  }
+
+  logWithTimestamp('Fetching threads');
+  const [activeThreads, archivedThreads] = await Promise.all([
+    channel.threads.fetchActive(),
+    channel.threads.fetchArchived()
+  ]);
+  
+  const allThreads = [...activeThreads.threads.values(), ...archivedThreads.threads.values()];
+  threadCache.set(channel.id, allThreads);
+  
+  return allThreads;
+}
+
+async function processThread(thread, isSecondLatest = false) {
+  try {
+    perfMonitor.start(`process-thread-${thread.id}`);
+    logWithTimestamp(`Processing thread: ${thread.name} (ID: ${thread.id})`);
+
+    if (!thread) {
+      logWithTimestamp('Invalid thread object received');
+      return;
+    }
+
+    if (thread.archived) {
+      logWithTimestamp(`Unarchiving thread: ${thread.name}`);
+      await thread.setArchived(false);
+    }
+
+    if (isSecondLatest) {
+      logWithTimestamp(`Sending message to second latest thread: ${thread.name}`);
+      await thread.send(process.env.MESSAGE_CONTENT);
+    }
+
+    if (!thread.locked) {
+      logWithTimestamp(`Locking thread: ${thread.name}`);
+      await thread.setLocked(true);
+    }
+  } catch (error) {
+    logWithTimestamp(`Error processing thread ${thread?.name || 'unknown'}: ${error.message}`);
+    throw error;
+  } finally {
+    perfMonitor.end(`process-thread-${thread.id}`);
+  }
+}
+
+async function processThreadsBatch(threads, newThreadId) {
+  const processedThreads = new Set();
+  let secondLatestProcessed = false;
+
+  for (let i = 0; i < threads.length; i += BATCH_SIZE) {
+    const batch = threads.slice(i, i + BATCH_SIZE);
+    
+    for (const thread of batch) {
+      if (thread.id === newThreadId || processedThreads.has(thread.id)) continue;
+      
+      if (await rateLimit.canProceed(thread.id)) {
+        const isSecondLatest = !secondLatestProcessed && thread.id !== newThreadId;
+        if (isSecondLatest) secondLatestProcessed = true;
+        
+        await processThread(thread, isSecondLatest);
+        processedThreads.add(thread.id);
+        
+        await new Promise(resolve => setTimeout(resolve, OPERATION_DELAY));
+      }
     }
   }
 }
 
-// Cache and Utility Instances
-let threadCache = {
-  timestamp: 0,
-  threads: []
-};
+// Bot Configuration
+const intents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent,
+  GatewayIntentBits.GuildMembers
+];
 
-const rateLimit = new RateLimit();
-const perfMonitor = new PerformanceMonitor();
+const client = new Client({ intents });
+const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// Utility Functions
+// Validation
 function validateConfig() {
   const requiredEnvVars = ['DISCORD_TOKEN', 'CHANNEL_ID', 'MESSAGE_CONTENT'];
   const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
@@ -70,110 +268,20 @@ function validateConfig() {
   }
 }
 
-async function withRetry(operation, maxRetries = RETRY_MAX_ATTEMPTS) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (attempt === maxRetries) throw error;
-      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-      console.log(`Retry attempt ${attempt} of ${maxRetries}`);
-    }
-  }
-}
-
-async function getThreadsWithCache(channel) {
-  const now = Date.now();
-  if (now - threadCache.timestamp < CACHE_DURATION) {
-    return threadCache.threads;
-  }
-
-  const activeThreads = await channel.threads.fetchActive();
-  const archivedThreads = await channel.threads.fetchArchived();
-  const allThreads = [...activeThreads.threads.values(), ...archivedThreads.threads.values()];
-  
-  threadCache = {
-    timestamp: now,
-    threads: allThreads
-  };
-  
-  return allThreads;
-}
-
-async function processThread(thread, isSecondLatest = false) {
-  if (thread.archived) {
-    console.log(`Unarchiving thread: ${thread.name}`);
-    await thread.setArchived(false);
-  }
-
-  if (isSecondLatest) {
-    console.log(`Sending message to second latest thread: ${thread.name}`);
-    await thread.send(process.env.MESSAGE_CONTENT);
-  }
-
-  if (!thread.locked) {
-    console.log(`Locking thread: ${thread.name}`);
-    await thread.setLocked(true);
-  }
-}
-
-async function processThreadsBatch(threads, newThreadId) {
-  const batches = [];
-  for (let i = 0; i < threads.length; i += BATCH_SIZE) {
-    batches.push(threads.slice(i, i + BATCH_SIZE));
-  }
-
-  let secondLatestProcessed = false;
-
-  for (const batch of batches) {
-    await Promise.all(batch.map(async thread => {
-      if (thread.id === newThreadId) return; // Skip the newest thread
-      
-      if (await rateLimit.canProceed(thread.id)) {
-        const isSecondLatest = !secondLatestProcessed && thread.id !== newThreadId;
-        if (isSecondLatest) secondLatestProcessed = true;
-        
-        await processThread(thread, isSecondLatest);
-      }
-    }));
-  }
-}
-
-// Bot Configuration
-const intents = [
-  GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.MessageContent,
-];
-
-// Create client instance
-const client = new Client({ intents });
-
-// Environment Variables
-const CHANNEL_ID = process.env.CHANNEL_ID;
-let lastThreadId = null;
-
-// Initialization
-try {
-  validateConfig();
-} catch (error) {
-  console.error('Configuration error:', error.message);
-  process.exit(1);
-}
-
-// Bot Event Handlers
+// Event Handlers
 client.once(Events.ClientReady, readyClient => {
-  console.log(`Ready! Logged in as ${readyClient.user.tag}`);
+  logWithTimestamp(`Ready! Logged in as ${readyClient.user.tag}`);
 });
 
 client.on(Events.ThreadCreate, async thread => {
   perfMonitor.start('threadProcessing');
-  console.log('ThreadCreate event triggered');
-  console.log('Thread ID:', thread.id);
-  console.log('Parent ID:', thread.parentId);
-  console.log('Thread Name:', thread.name);
+  logWithTimestamp('ThreadCreate event triggered');
+  logWithTimestamp(`Thread ID: ${thread.id}`);
+  logWithTimestamp(`Parent ID: ${thread.parentId}`);
+  logWithTimestamp(`Thread Name: ${thread.name}`);
 
-  if (thread.parentId !== CHANNEL_ID) {
+  if (thread.parentId !== CHANNEL_ID.toString()) {
+    logWithTimestamp(`Thread parent ID ${thread.parentId} does not match CHANNEL_ID ${CHANNEL_ID}`);
     perfMonitor.end('threadProcessing');
     return;
   }
@@ -182,53 +290,55 @@ client.on(Events.ThreadCreate, async thread => {
     await withRetry(async () => {
       const channel = await client.channels.fetch(CHANNEL_ID);
       const allThreads = await getThreadsWithCache(channel);
-      
-      // Filter and sort threads
+
       const unlockedThreads = allThreads
         .filter(t => !t.locked)
         .sort((a, b) => b.createdAt - a.createdAt);
 
       if (unlockedThreads.length >= 2) {
         await processThreadsBatch(unlockedThreads, thread.id);
+      } else {
+        logWithTimestamp('Not enough unlocked threads to process');
       }
     });
-
-    lastThreadId = thread.id;
-    console.log(`Updated lastThreadId to: ${lastThreadId}`);
   } catch (error) {
-    console.error('Error in thread processing:', error);
+    logWithTimestamp(`Error in thread processing: ${error}`);
   } finally {
     perfMonitor.end('threadProcessing');
   }
 });
 
 client.on(Events.Error, error => {
-  console.error('Discord client error:', error);
+  logWithTimestamp(`Discord client error: ${error}`);
 });
 
-// Bot Login
-client.login(process.env.DISCORD_TOKEN)
-  .then(() => {
-    console.log('Bot logged in successfully!');
-  })
-  .catch((err) => {
-    console.error('Failed to log in:', err);
-    process.exit(1);
-  });
+// Initialization and Error Handling
+try {
+  validateConfig();
+  client.login(process.env.DISCORD_TOKEN)
+    .then(() => logWithTimestamp('Bot logged in successfully!'))
+    .catch(err => {
+      logWithTimestamp(`Failed to log in: ${err}`);
+      process.exit(1);
+    });
+} catch (error) {
+  logWithTimestamp(`Configuration error: ${error.message}`);
+  process.exit(1);
+}
 
 // Graceful Shutdown
 process.on('SIGINT', () => {
-  console.log('Received SIGINT. Cleaning up...');
+  logWithTimestamp('Received SIGINT. Cleaning up...');
   client.destroy();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  console.log('Received SIGTERM. Cleaning up...');
+  logWithTimestamp('Received SIGTERM. Cleaning up...');
   client.destroy();
   process.exit(0);
 });
 
 process.on('unhandledRejection', (error) => {
-  console.error('Unhandled promise rejection:', error);
+  logWithTimestamp(`Unhandled promise rejection: ${error}`);
 });
