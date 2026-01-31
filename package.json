@@ -1,0 +1,20 @@
+{
+  "name": "threadlocker",
+  "version": "1.0.0",
+  "description": "Discord bot for thread management",
+  "main": "threadlocker.js",
+  "scripts": {
+    "start": "node threadlocker.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "threads"
+  ],
+  "author": "",
+  "license": "ISC"
+}
